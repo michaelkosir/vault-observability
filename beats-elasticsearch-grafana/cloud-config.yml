@@ -1,0 +1,226 @@
+# cloud-config
+
+package_update: true
+package_upgrade: true
+
+apt:
+  sources:
+    hashicorp:
+      source: "deb https://apt.releases.hashicorp.com $RELEASE main"
+      keyid: 798AEC654E5C15428C8E42EEAA16FCBCA621E701
+
+    docker:
+      source: "deb https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+    elastic:
+      source: "deb https://artifacts.elastic.co/packages/8.x/apt stable main"
+      keyid: 46095ACC8548582C1A2699A9D27D666CD88E42B4
+
+packages:
+  - jq
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+  - vault=1.18.2-1
+  - filebeat=8.16.1
+  - metricbeat=8.16.1
+
+write_files:
+  - path: /etc/vault.d/vault.hcl
+    content: |
+      ui = true
+
+      log_format = "json"
+      log_level  = "info"
+
+      storage "file" {
+        path = "/opt/vault/data"
+      }
+
+      listener "tcp" {
+        address     = "0.0.0.0:8200"
+        tls_disable = true
+      }
+
+      telemetry {
+        disable_hostname      = true
+        enable_hostname_label = true
+        statsd_address        = "127.0.0.1:8125"
+      }
+
+  - path: /etc/filebeat/filebeat.yml
+    content: |
+      filebeat.inputs:
+
+        - type: tcp
+          tags: ["audit"]
+          host: "0.0.0.0:9090"
+          processors:
+            - decode_json_fields:
+                fields: ["message"]
+                target: "message"
+                overwrite_keys: true
+                add_error_key: true
+
+            - drop_event:
+                when:
+                  has_fields: ["error.message"]
+
+        - type: journald
+          include_matches: ["_SYSTEMD_UNIT=vault.service"]
+          processors:
+            - decode_json_fields:
+                fields: ["message"]
+                target: "message"
+                overwrite_keys: true
+                add_error_key: true
+
+            - drop_event:
+                when:
+                  has_fields: ["error.message"]
+            
+            - add_tags:
+                when:
+                  has_fields: ["message.@level"]
+                tags: ["operational"]
+
+            - add_tags:
+                when:
+                  not:
+                    has_fields: ["message.@level"]
+                tags: ["backup"]
+
+      output.elasticsearch:
+        hosts: ["localhost:9200"]
+        indices:
+          - index: "vault-audit-%{+yyyy.MM.dd}"
+            when.contains:
+              tags: "audit"
+
+          - index: "vault-operational-%{+yyyy.MM.dd}"
+            when.contains:
+              tags: "operational"
+          
+          - index: "vault-audit-backup-%{+yyyy.MM.dd}"
+            when.contains:
+              tags: "backup"
+
+  - path: /etc/metricbeat/metricbeat.yml
+    content: |
+      metricbeat.modules:
+
+        - module: system
+          period: 10s
+          tags: ["system"]
+          metricsets:
+            - cpu           # CPU usage
+            - load          # CPU load averages
+            - memory        # Memory usage
+            - network       # Network IO
+            - process       # Per process metrics
+            - filesystem    # Filesystem stats
+            - fsstat        # Aggregate disk stats
+            - diskio        # Disk I/O
+            - uptime        # System uptime
+
+        - module: statsd
+          host: "localhost"
+          port: 8125
+          tags: ["telemetry"]
+
+      output.elasticsearch:
+        hosts: ["localhost:9200"]
+        indices:
+          - index: "vault-telemetry-%{+yyyy.MM.dd}"
+            when.contains:
+              tags: "telemetry"
+          - index: "vault-system-%{+yyyy.MM.dd}"
+            when.contains:
+              tags: "system"
+
+runcmd:
+  - apt-get autoremove -y
+
+  # docker
+  - usermod -aG docker ubuntu
+
+  # disable swap
+  - sysctl vm.swappiness=0
+  - echo "vm.swappiness = 0" | tee -a /etc/sysctl.conf
+
+  # vault configuration
+  - chown root:vault /etc/vault.d/*
+  - chmod 0640 /etc/vault.d/*
+
+  # run elasticsearch in docker
+  - |
+    docker run \
+      --name elasticsearch \
+      --net=bridge \
+      --rm \
+      --detach \
+      -p 9200:9200 \
+      -e "node.name=elasticsearch" \
+      -e "discovery.type=single-node" \
+      -e "xpack.security.enabled=false" \
+      -e "logger.level=WARN" \
+      -e "ES_JAVA_OPTS=-Xms1024m -Xmx1024m" \
+      docker.elastic.co/elasticsearch/elasticsearch:8.16.1
+
+  # run grafana in docker
+  - |
+    docker run \
+      --name grafana \
+      --net=bridge \
+      --rm \
+      --detach \
+      -p 3000:3000 \
+      -e "GF_SECURITY_ADMIN_USER=admin" \
+      -e "GF_SECURITY_ADMIN_PASSWORD=admin" \
+      grafana/grafana:latest
+
+  # wait for elasticsearch to be ready
+  - |
+    until curl -s http://localhost:9200/_cluster/health | jq -r .status | grep -q 'yellow\|green'; do
+      echo "Waiting for Elasticsearch to be ready..."
+      sleep 1
+    done
+
+  # wait for grafana to be ready
+  - |
+    until curl -s http://localhost:3000/api/health | jq -r .database | grep -q 'ok'; do
+      echo "Waiting for Grafana to be ready..."
+      sleep 1
+    done
+
+  # enable and start filebeat, metricbeat, and vault
+  - systemctl enable filebeat metricbeat --now
+  - systemctl enable vault --now
+
+  # wait for vault to be ready
+  - |
+    until curl -s http://localhost:8200/v1/sys/health | jq -r .initialized | grep -q 'false'; do
+      echo "Waiting for Vault to be ready..."
+      sleep 1
+    done
+
+  ###############################################
+  # VAULT SETUP BELOW IS FOR DEMO PURPOSES ONLY #
+  ###############################################
+
+  # init/unseal
+  - export VAULT_ADDR="http://localhost:8200"
+  - vault operator init -key-shares=1 -key-threshold=1 -format=json > /etc/vault.d/init.json
+  - vault operator unseal $(jq -r .unseal_keys_b64[0] /etc/vault.d/init.json)
+  - vault login $(jq -r .root_token /etc/vault.d/init.json)
+
+  # enable audit
+  - vault audit enable socket address=127.0.0.1:9090
+  - vault audit enable file file_path=stdout
+
+  # ease of use
+  - echo "export VAULT_ADDR=http://localhost:8200" >> /etc/profile.d/vault.sh
+  - echo "export VAULT_TOKEN=$(jq -r .root_token /etc/vault.d/init.json)" >> /etc/profile.d/vault.sh
