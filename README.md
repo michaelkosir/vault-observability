@@ -1,6 +1,14 @@
 # Vault Observability Demo
 This repository provides a demo of observability for HashiCorp Vault. It is not meant to be exact production settings for logging/monitoring Vault.
 
+# Observability
+Observability is the ability to measure the internal states of a system by examining its outputs. In the context of HashiCorp Vault, the key outputs to examine are log files, telemetry metrics, and data scraped from API endpoints. The following items are being captured for Vault Observability:
+
+- Vault Operational Logs
+- Vault Audit Logs
+- Vault Telemetry
+- Host Metrics
+
 # Versions
 As this repository is for demo purposes, I have locked software versions to verify repeatability. Update these at your own risk.
 
