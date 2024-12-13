@@ -13,9 +13,10 @@ Observability is the ability to measure the internal states of a system by exami
 As this repository is for demo purposes, I have locked software versions to verify repeatability. Update these at your own risk.
 
 ```
-vault    = 1.18.2-1
-elastic  = 8.16.1
-grafana  = 11.4.0
+vault      = 1.18.2-1
+elastic    = 8.16.1
+grafana    = 11.4.0
+fluent-bit = 3.2.2
 ```
 
 # Usage
