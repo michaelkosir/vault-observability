@@ -1,0 +1,200 @@
+# cloud-config
+
+package_update: true
+package_upgrade: true
+
+apt:
+  sources:
+    hashicorp:
+      source: "deb https://apt.releases.hashicorp.com $RELEASE main"
+      keyid: 798AEC654E5C15428C8E42EEAA16FCBCA621E701
+
+    docker:
+      source: "deb https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+    elastic:
+      source: "deb https://artifacts.elastic.co/packages/8.x/apt stable main"
+      keyid: 46095ACC8548582C1A2699A9D27D666CD88E42B4
+
+    fluentbit:
+      source: "deb https://packages.fluentbit.io/ubuntu/$RELEASE $RELEASE main"
+      keyid: C3C0A28534B9293EAF51FABD9F9DDC083888C1CD
+
+packages:
+  - jq
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+  - vault=1.18.2-1
+  - fluent-bit=3.2.2
+
+write_files:
+  - path: /etc/vault.d/vault.hcl
+    content: |
+      ui = true
+
+      log_format = "json"
+      log_level  = "info"
+
+      storage "file" {
+        path = "/opt/vault/data"
+      }
+
+      listener "tcp" {
+        address     = "0.0.0.0:8200"
+        tls_disable = true
+      }
+
+      telemetry {
+        disable_hostname      = true
+        enable_hostname_label = true
+        statsd_address        = "127.0.0.1:8125"
+      }
+
+  - path: /etc/fluent-bit/fluent-bit.yml
+    content: |
+      service:
+        flush: 1
+        log_level: info
+
+      pipeline:
+        inputs:
+          - name: tcp
+            tag: audit
+            listen: 127.0.0.1
+            port: 9090
+
+          - name: systemd
+            tag: systemd
+            systemd_filter: _SYSTEMD_UNIT=vault.service
+
+          - name: statsd
+            tag: telemetry
+            listen: 127.0.0.1
+            port: 8125
+
+          - name: cpu
+            tag: host.cpu
+            interval_sec: 10
+
+          - name: disk
+            tag: host.disk
+            interval_sec: 10
+
+          - name: mem
+            tag: host.memory
+            interval_sec: 10
+
+        outputs:
+          - name: es
+            match: audit
+            logstash_format: true
+            logstash_prefix: vault-audit
+            suppress_type_name: true
+
+          - name: es
+            match: systemd
+            logstash_format: true
+            logstash_prefix: vault-audit
+            suppress_type_name: true
+
+          - name: es
+            match: telemetry
+            logstash_format: true
+            logstash_prefix: vault-telemetry
+            suppress_type_name: true
+
+          - name: es
+            match: host.*
+            logstash_format: true
+            logstash_prefix: vault-system
+            suppress_type_name: true
+
+runcmd:
+  - apt-get autoremove -y
+
+  # docker
+  - usermod -aG docker ubuntu
+
+  # disable swap
+  - sysctl vm.swappiness=0
+  - echo "vm.swappiness = 0" | tee -a /etc/sysctl.conf
+
+  # vault configuration
+  - chown root:vault /etc/vault.d/*
+  - chmod 0640 /etc/vault.d/*
+
+  # run elasticsearch in docker
+  - |
+    docker run \
+      --name elasticsearch \
+      --net=bridge \
+      --rm \
+      --detach \
+      -p 9200:9200 \
+      -e "node.name=elasticsearch" \
+      -e "discovery.type=single-node" \
+      -e "xpack.security.enabled=false" \
+      -e "logger.level=WARN" \
+      -e "ES_JAVA_OPTS=-Xms1024m -Xmx1024m" \
+      docker.elastic.co/elasticsearch/elasticsearch:8.16.1
+
+  # wait for elasticsearch to be ready
+  - |
+    until curl -s http://localhost:9200/_cluster/health | jq -r .status | grep -q 'yellow\|green'; do
+      echo "Waiting for Elasticsearch to be ready..."
+      sleep 1
+    done
+
+  # run kibana in docker
+  - |
+    docker run \
+      --name kibana \
+      --net=bridge \
+      --rm \
+      --detach \
+      -p 5601:5601 \
+      -e "ELASTICSEARCH_HOSTS=http://$ES_IP:9200" \
+      docker.elastic.co/kibana/kibana:8.16.1
+
+  # wait for kibana to be ready
+  - |
+    until curl -s http://localhost:5601/api/status | jq -r .status.overall.level | grep -q 'available'; do
+      echo "Waiting for Kibana to be ready..."
+      sleep 1
+    done
+
+  # change service
+  - sed -i 's|//etc/fluent-bit/fluent-bit.conf|/etc/fluent-bit/fluent-bit.yml|' /usr/lib/systemd/system/fluent-bit.service
+
+  # enable and start filebeat, metricbeat, and vault
+  - systemctl enable fluent-bit --now
+  - systemctl enable vault --now
+
+  # wait for vault to be ready
+  - |
+    until curl -s http://localhost:8200/v1/sys/health | jq -r .initialized | grep -q 'false'; do
+      echo "Waiting for Vault to be ready..."
+      sleep 1
+    done
+
+  ###############################################
+  # VAULT SETUP BELOW IS FOR DEMO PURPOSES ONLY #
+  ###############################################
+
+  # init/unseal
+  - export VAULT_ADDR="http://localhost:8200"
+  - vault operator init -key-shares=1 -key-threshold=1 -format=json > /etc/vault.d/init.json
+  - vault operator unseal $(jq -r .unseal_keys_b64[0] /etc/vault.d/init.json)
+  - vault login $(jq -r .root_token /etc/vault.d/init.json)
+
+  # enable audit
+  - vault audit enable socket address=127.0.0.1:9090
+  - vault audit enable file file_path=stdout
+
+  # ease of use
+  - echo "export VAULT_ADDR=http://localhost:8200" >> /etc/profile.d/vault.sh
+  - echo "export VAULT_TOKEN=$(jq -r .root_token /etc/vault.d/init.json)" >> /etc/profile.d/vault.sh
